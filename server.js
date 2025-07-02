@@ -1,11 +1,11 @@
 const express = require('express');
-const { exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const { MongoClient } = require('mongodb');
 const nodemailer = require('nodemailer');
+const { exec } = require('child_process');
 
 const app = express();
 const PORT = 5000;
@@ -28,96 +28,64 @@ function log(level, message, data = null) {
   }
 }
 
-// Configure nodemailer transporter (more reliable than PHP mail)
-const transporter = nodemailer.createTransport({
-  host: 'localhost', // Use local sendmail
-  port: 25,
-  secure: false,
-  tls: {
-    rejectUnauthorized: false
-  },
-  // Fallback to sendmail if SMTP fails
-  sendmail: true,
-  newline: 'unix',
-  path: '/usr/sbin/sendmail'
-});
+// Email transporter configurations for localhost
+const createTransporters = () => {
+  const transporters = [];
 
-// Test email configuration on startup
-async function testEmailConfig() {
+  // 1. Sendmail (Linux/Unix systems)
   try {
-    await transporter.verify();
-    log('info', 'Email transporter is ready');
-    return true;
+    const sendmailTransporter = nodemailer.createTransport({
+      sendmail: true,
+      newline: 'unix',
+      path: '/usr/sbin/sendmail'
+    });
+    transporters.push({ name: 'Sendmail', transporter: sendmailTransporter });
   } catch (error) {
-    log('warn', 'Email transporter verification failed, will use PHP fallback', error);
-    return false;
+    log('warn', 'Sendmail transporter failed to initialize', error.message);
   }
-}
 
-// Enhanced PHP mail script with better error reporting
-const phpScript = `<?php
-error_reporting(E_ALL);
-ini_set('display_errors', 1);
+  // 2. Local SMTP (if postfix/exim is running)
+  try {
+    const localSMTPTransporter = nodemailer.createTransport({
+      host: 'localhost',
+      port: 25,
+      secure: false,
+      ignoreTLS: true,
+      tls: {
+        rejectUnauthorized: false
+      }
+    });
+    transporters.push({ name: 'Local SMTP', transporter: localSMTPTransporter });
+  } catch (error) {
+    log('warn', 'Local SMTP transporter failed to initialize', error.message);
+  }
 
-function sendEmail($to, $subject, $message, $fromName, $fromEmail) {
-    // More comprehensive headers
-    $headers = "MIME-Version: 1.0" . "\\r\\n";
-    $headers .= "Content-type:text/html;charset=UTF-8" . "\\r\\n";
-    $headers .= "From: " . $fromName . " <" . $fromEmail . ">" . "\\r\\n";
-    $headers .= "Reply-To: " . $fromEmail . "\\r\\n";
-    $headers .= "Return-Path: " . $fromEmail . "\\r\\n";
-    $headers .= "X-Mailer: PHP/" . phpversion() . "\\r\\n";
-    $headers .= "X-Priority: 3" . "\\r\\n";
-    
-    // Log the attempt
-    error_log("Attempting to send email to: $to");
-    error_log("Subject: $subject");
-    error_log("From: $fromName <$fromEmail>");
-    
-    $result = mail($to, $subject, $message, $headers);
-    
-    if ($result) {
-        error_log("PHP mail() returned SUCCESS for $to");
-    } else {
-        error_log("PHP mail() returned FAILED for $to");
-        $error = error_get_last();
-        if ($error) {
-            error_log("Last error: " . print_r($error, true));
-        }
-    }
-    
-    return $result;
-}
+  // 3. Alternative local SMTP port
+  try {
+    const altSMTPTransporter = nodemailer.createTransport({
+      host: '127.0.0.1',
+      port: 587,
+      secure: false,
+      ignoreTLS: true,
+      tls: {
+        rejectUnauthorized: false
+      }
+    });
+    transporters.push({ name: 'Alt SMTP', transporter: altSMTPTransporter });
+  } catch (error) {
+    log('warn', 'Alternative SMTP transporter failed to initialize', error.message);
+  }
 
-// Validate input
-if ($argc < 6) {
-    echo "ERROR: Insufficient arguments";
-    exit(1);
-}
+  // 4. JSON transport for testing (saves to file)
+  const jsonTransporter = nodemailer.createTransport({
+    jsonTransport: true
+  });
+  transporters.push({ name: 'JSON File', transporter: jsonTransporter });
 
-$to = $argv[1];
-$subject = $argv[2];
-$message = $argv[3];
-$fromName = $argv[4];
-$fromEmail = $argv[5];
+  return transporters;
+};
 
-// Validate email
-if (!filter_var($to, FILTER_VALIDATE_EMAIL)) {
-    echo "ERROR: Invalid recipient email";
-    exit(1);
-}
-
-if (!filter_var($fromEmail, FILTER_VALIDATE_EMAIL)) {
-    echo "ERROR: Invalid sender email";
-    exit(1);
-}
-
-$result = sendEmail($to, $subject, $message, $fromName, $fromEmail);
-echo $result ? "SUCCESS" : "FAILED";
-?>`;
-
-const phpScriptPath = path.join(__dirname, 'send_mail.php');
-fs.writeFileSync(phpScriptPath, phpScript);
+let transporters = createTransporters();
 
 // Middleware
 app.use(cors());
@@ -138,7 +106,6 @@ async function connectToDatabase() {
     const db = client.db(DB_NAME);
     const collection = db.collection(COLLECTION_NAME);
     
-    // Create index for jobId uniqueness
     await collection.createIndex({ jobId: 1 }, { unique: true });
     log('info', `Connected to MongoDB at ${MONGO_URI}`);
     return { db, collection };
@@ -148,159 +115,213 @@ async function connectToDatabase() {
   }
 }
 
-// Helper functions
-function escapeShellArg(arg) {
-  return "'" + arg.replace(/'/g, "'\\''") + "'";
+// Check system mail configuration
+async function checkSystemMailConfig() {
+  const checks = {
+    sendmail: false,
+    postfix: false,
+    exim: false,
+    mailq: false
+  };
+
+  try {
+    // Check for sendmail
+    await new Promise((resolve, reject) => {
+      exec('which sendmail', (error, stdout) => {
+        checks.sendmail = !error && stdout.trim().length > 0;
+        resolve();
+      });
+    });
+
+    // Check for postfix
+    await new Promise((resolve, reject) => {
+      exec('systemctl is-active postfix', (error, stdout) => {
+        checks.postfix = !error && stdout.trim() === 'active';
+        resolve();
+      });
+    });
+
+    // Check for exim
+    await new Promise((resolve, reject) => {
+      exec('systemctl is-active exim4', (error, stdout) => {
+        checks.exim = !error && stdout.trim() === 'active';
+        resolve();
+      });
+    });
+
+    // Check mail queue
+    await new Promise((resolve, reject) => {
+      exec('mailq', (error, stdout) => {
+        checks.mailq = !error;
+        resolve();
+      });
+    });
+
+  } catch (error) {
+    log('warn', 'Error checking system mail config', error.message);
+  }
+
+  return checks;
 }
 
-// Enhanced email sending with both nodemailer and PHP fallback
-async function sendEmailViaPHP(to, subject, message, fromName, fromEmail) {
-  return new Promise((resolve) => {
-    const command = `php ${phpScriptPath} ${escapeShellArg(to)} ${escapeShellArg(subject)} ${escapeShellArg(message)} ${escapeShellArg(fromName)} ${escapeShellArg(fromEmail)}`;
-    
-    log('debug', `Executing PHP command for ${to}`);
-    
-    exec(command, (error, stdout, stderr) => {
-      const result = {
+// Enhanced email sending function
+async function sendEmailWithFallback(to, subject, message, fromName, fromEmail) {
+  log('info', `Attempting to send email to ${to}`, { subject, fromName, fromEmail });
+  
+  const errors = [];
+  
+  for (const { name, transporter } of transporters) {
+    try {
+      log('debug', `Trying ${name} transporter for ${to}`);
+      
+      const mailOptions = {
+        from: `${fromName} <${fromEmail}>`,
+        to: to,
+        subject: subject,
+        html: message,
+        text: message.replace(/<[^>]*>/g, ''), // Strip HTML for text version
+        headers: {
+          'X-Mailer': 'Node.js Email Sender',
+          'X-Priority': '3'
+        }
+      };
+
+      const info = await transporter.sendMail(mailOptions);
+      
+      // Handle different response types
+      let result = {
         recipient: to,
-        method: 'PHP',
+        success: true,
+        method: name,
         timestamp: new Date().toISOString()
       };
 
-      if (error) {
-        log('error', `PHP execution error for ${to}`, error);
-        result.success = false;
-        result.error = error.message;
-        result.details = stderr;
+      if (name === 'JSON File') {
+        // JSON transport returns the email as JSON
+        const emailData = JSON.parse(info.message);
+        result.messageData = emailData;
+        log('info', `Email saved to JSON for ${to}`, emailData);
+        
+        // Save to file for debugging
+        const emailsDir = path.join(__dirname, 'sent_emails');
+        if (!fs.existsSync(emailsDir)) {
+          fs.mkdirSync(emailsDir);
+        }
+        const fileName = `email_${Date.now()}_${to.replace(/[^a-zA-Z0-9]/g, '_')}.json`;
+        fs.writeFileSync(path.join(emailsDir, fileName), JSON.stringify(emailData, null, 2));
+        
       } else {
-        const output = stdout.trim();
-        log('debug', `PHP output for ${to}: ${output}`);
-        
-        if (stderr) {
-          log('warn', `PHP stderr for ${to}: ${stderr}`);
-        }
-        
-        result.success = output === 'SUCCESS';
-        result.output = output;
-        result.phpErrors = stderr;
-        
-        if (!result.success) {
-          log('warn', `PHP mail failed for ${to}`, { output, stderr });
-        }
+        result.messageId = info.messageId;
+        result.response = info.response;
+        log('info', `Email sent successfully via ${name} to ${to}`, { 
+          messageId: info.messageId,
+          response: info.response 
+        });
       }
       
-      resolve(result);
-    });
-  });
-}
-
-// Nodemailer email sending
-async function sendEmailViaNodemailer(to, subject, message, fromName, fromEmail) {
-  try {
-    log('debug', `Sending email via Nodemailer to ${to}`);
-    
-    const info = await transporter.sendMail({
-      from: `${fromName} <${fromEmail}>`,
-      to: to,
-      subject: subject,
-      html: message,
-      text: message.replace(/<[^>]*>/g, '') // Strip HTML for text version
-    });
-    
-    log('info', `Nodemailer success for ${to}`, { messageId: info.messageId });
-    
-    return {
-      recipient: to,
-      success: true,
-      method: 'Nodemailer',
-      messageId: info.messageId,
-      timestamp: new Date().toISOString()
-    };
-  } catch (error) {
-    log('error', `Nodemailer failed for ${to}`, error);
-    return {
-      recipient: to,
-      success: false,
-      method: 'Nodemailer',
-      error: error.message,
-      timestamp: new Date().toISOString()
-    };
-  }
-}
-
-// Combined email sending function
-async function sendEmail(to, subject, message, fromName, fromEmail) {
-  log('info', `Attempting to send email to ${to}`);
-  
-  // Try Nodemailer first
-  const nodemailerResult = await sendEmailViaNodemailer(to, subject, message, fromName, fromEmail);
-  
-  if (nodemailerResult.success) {
-    return nodemailerResult;
+      return result;
+      
+    } catch (error) {
+      log('warn', `${name} transporter failed for ${to}`, error.message);
+      errors.push({ method: name, error: error.message });
+      continue;
+    }
   }
   
-  // Fallback to PHP
-  log('warn', `Nodemailer failed for ${to}, trying PHP fallback`);
-  const phpResult = await sendEmailViaPHP(to, subject, message, fromName, fromEmail);
-  
-  return phpResult;
+  // All transporters failed
+  log('error', `All email methods failed for ${to}`, errors);
+  return {
+    recipient: to,
+    success: false,
+    errors: errors,
+    timestamp: new Date().toISOString()
+  };
 }
 
 // Routes
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'OK', message: 'Bulk email sender is running' });
+  res.json({ 
+    status: 'OK', 
+    message: 'Node.js email sender is running',
+    transporters: transporters.length,
+    timestamp: new Date().toISOString()
+  });
 });
 
-// Email configuration test endpoint
-app.get('/api/test-config', async (req, res) => {
+// System configuration check
+app.get('/api/system-check', async (req, res) => {
   try {
-    const nodemailerTest = await testEmailConfig();
+    const systemChecks = await checkSystemMailConfig();
     
-    // Test PHP mail configuration
-    const phpTest = await new Promise((resolve) => {
-      exec('php -m | grep -i mail', (error, stdout, stderr) => {
-        resolve(!error && stdout.includes('mail'));
-      });
-    });
-    
-    // Check sendmail
-    const sendmailTest = await new Promise((resolve) => {
-      exec('which sendmail', (error, stdout) => {
-        resolve(!error && stdout.trim().length > 0);
-      });
-    });
+    // Test each transporter
+    const transporterStatus = [];
+    for (const { name, transporter } of transporters) {
+      try {
+        if (name !== 'JSON File') {
+          await transporter.verify();
+          transporterStatus.push({ name, status: 'working' });
+        } else {
+          transporterStatus.push({ name, status: 'available' });
+        }
+      } catch (error) {
+        transporterStatus.push({ name, status: 'failed', error: error.message });
+      }
+    }
     
     res.json({
-      nodemailer: nodemailerTest,
-      phpMail: phpTest,
-      sendmail: sendmailTest,
-      recommendations: {
-        nodemailer: nodemailerTest ? 'Working' : 'Install and configure mail server',
-        phpMail: phpTest ? 'Available' : 'PHP mail extension not found',
-        sendmail: sendmailTest ? 'Available' : 'Install sendmail: sudo apt-get install sendmail'
-      }
+      system: systemChecks,
+      transporters: transporterStatus,
+      recommendations: generateRecommendations(systemChecks, transporterStatus)
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
+function generateRecommendations(systemChecks, transporterStatus) {
+  const recommendations = [];
+  
+  if (!systemChecks.sendmail) {
+    recommendations.push('Install sendmail: sudo apt-get install sendmail');
+  }
+  
+  if (!systemChecks.postfix && !systemChecks.exim) {
+    recommendations.push('Install mail server: sudo apt-get install postfix');
+  }
+  
+  const workingTransporters = transporterStatus.filter(t => t.status === 'working').length;
+  if (workingTransporters === 0) {
+    recommendations.push('Configure a mail server on localhost');
+    recommendations.push('Emails will be saved as JSON files for testing');
+  }
+  
+  return recommendations;
+}
+
 // Test email endpoint
 app.post('/api/test-email', async (req, res) => {
   try {
-    const { to, fromName = 'Test Sender', fromEmail = 'noreply@ec2-51-20-248-157.eu-north-1.compute.amazonaws.com' } = req.body;
+    const { to, fromName = 'Test Sender', fromEmail = 'noreply@localhost' } = req.body;
     
     if (!to) {
       return res.status(400).json({ error: 'Recipient email is required' });
     }
     
-    const result = await sendEmail(
-      to,
-      'Test Email - ' + new Date().toISOString(),
-      '<h1>Test Email</h1><p>This is a test email sent at ' + new Date().toISOString() + '</p>',
-      fromName,
-      fromEmail
-    );
+    const testSubject = `Test Email - ${new Date().toISOString()}`;
+    const testMessage = `
+      <html>
+        <body>
+          <h1>🧪 Test Email</h1>
+          <p>This is a test email sent from your Node.js email server.</p>
+          <p><strong>Sent at:</strong> ${new Date().toISOString()}</p>
+          <p><strong>Server:</strong> localhost:${PORT}</p>
+          <hr>
+          <p><small>If you received this email, your email configuration is working!</small></p>
+        </body>
+      </html>
+    `;
+    
+    const result = await sendEmailWithFallback(to, testSubject, testMessage, fromName, fromEmail);
     
     res.json(result);
   } catch (error) {
@@ -309,6 +330,7 @@ app.post('/api/test-email', async (req, res) => {
   }
 });
 
+// Bulk email endpoint
 app.post('/api/send-bulk', async (req, res) => {
   try {
     const { recipients, subject, message, fromName, fromEmail } = req.body;
@@ -328,11 +350,21 @@ app.post('/api/send-bulk', async (req, res) => {
       return res.status(400).json({ error: 'Subject and message are required' });
     }
     
+    // Validate email addresses
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    const invalidEmails = recipients.filter(email => !emailRegex.test(email.trim()));
+    if (invalidEmails.length > 0) {
+      return res.status(400).json({ 
+        error: 'Invalid email addresses found',
+        invalidEmails 
+      });
+    }
+    
     const emailContent = {
       subject,
       message,
       fromName: fromName || 'No Reply',
-      fromEmail: fromEmail || 'noreply@ec2-51-20-248-157.eu-north-1.compute.amazonaws.com'
+      fromEmail: fromEmail || 'noreply@localhost'
     };
     
     const jobId = Date.now().toString();
@@ -353,7 +385,8 @@ app.post('/api/send-bulk', async (req, res) => {
       failed: 0,
       results: [],
       emailContent,
-      startedAt: new Date()
+      startedAt: new Date(),
+      server: 'localhost'
     });
     
     // Start bulk sending (async)
@@ -363,7 +396,8 @@ app.post('/api/send-bulk', async (req, res) => {
       success: true,
       jobId,
       message: `Started sending ${recipients.length} emails`,
-      status: 'processing'
+      status: 'processing',
+      server: 'localhost'
     });
     
   } catch (error) {
@@ -379,12 +413,12 @@ async function sendBulkEmails(recipients, emailContent, jobId, collection) {
   let failed = 0;
   
   for (let i = 0; i < recipients.length; i++) {
-    const recipient = recipients[i];
+    const recipient = recipients[i].trim();
     
     try {
       log('debug', `Sending email ${i + 1}/${recipients.length} to ${recipient}`);
       
-      const result = await sendEmail(
+      const result = await sendEmailWithFallback(
         recipient,
         emailContent.subject,
         emailContent.message,
@@ -394,21 +428,26 @@ async function sendBulkEmails(recipients, emailContent, jobId, collection) {
       
       if (result.success) {
         successful++;
-        log('info', `Email sent successfully to ${recipient}`, result);
+        log('info', `✅ Email sent successfully to ${recipient}`, { method: result.method });
       } else {
         failed++;
-        log('warn', `Email failed to ${recipient}`, result);
+        log('warn', `❌ Email failed to ${recipient}`, result.errors);
       }
       
       // Update job progress in MongoDB
       await collection.updateOne(
         { jobId },
         {
-          $inc: { processed: 1, successful: result.success ? 1 : 0, failed: result.success ? 0 : 1 },
+          $inc: { 
+            processed: 1, 
+            successful: result.success ? 1 : 0, 
+            failed: result.success ? 0 : 1 
+          },
           $push: { results: result },
           $set: { 
             status: 'processing',
-            lastUpdate: new Date()
+            lastUpdate: new Date(),
+            progressPercentage: Math.round(((i + 1) / recipients.length) * 100)
           }
         }
       );
@@ -433,38 +472,41 @@ async function sendBulkEmails(recipients, emailContent, jobId, collection) {
           },
           $set: { 
             status: 'processing',
-            lastUpdate: new Date()
+            lastUpdate: new Date(),
+            progressPercentage: Math.round(((i + 1) / recipients.length) * 100)
           }
         }
       );
     }
     
-    // Small delay to avoid overwhelming the server
-    await new Promise(resolve => setTimeout(resolve, 500));
+    // Delay between emails to avoid overwhelming
+    await new Promise(resolve => setTimeout(resolve, 200));
   }
   
   // Mark job as completed
+  const successRate = ((successful / recipients.length) * 100).toFixed(2);
   await collection.updateOne(
     { jobId },
     {
       $set: {
         status: 'completed',
         completedAt: new Date(),
+        progressPercentage: 100,
         summary: {
           total: recipients.length,
           successful,
           failed,
-          successRate: ((successful / recipients.length) * 100).toFixed(2) + '%'
+          successRate: successRate + '%'
         }
       }
     }
   );
   
-  log('info', `Bulk email job ${jobId} completed`, { 
+  log('info', `✅ Bulk email job ${jobId} completed`, { 
     total: recipients.length, 
     successful, 
     failed,
-    successRate: ((successful / recipients.length) * 100).toFixed(2) + '%'
+    successRate: successRate + '%'
   });
 }
 
@@ -476,11 +518,6 @@ app.get('/api/job/:jobId', async (req, res) => {
     
     if (!job) {
       return res.status(404).json({ error: 'Job not found' });
-    }
-    
-    // Add real-time progress calculation
-    if (job.total > 0) {
-      job.progressPercentage = Math.round((job.processed / job.total) * 100);
     }
     
     res.json(job);
@@ -497,13 +534,6 @@ app.get('/api/jobs', async (req, res) => {
       .sort({ startedAt: -1 })
       .limit(50)
       .toArray();
-    
-    // Add progress percentage to each job
-    jobs.forEach(job => {
-      if (job.total > 0) {
-        job.progressPercentage = Math.round((job.processed / job.total) * 100);
-      }
-    });
     
     res.json(jobs);
   } catch (error) {
@@ -529,31 +559,70 @@ app.delete('/api/job/:jobId', async (req, res) => {
   }
 });
 
+// View sent emails (JSON files)
+app.get('/api/sent-emails', (req, res) => {
+  try {
+    const emailsDir = path.join(__dirname, 'sent_emails');
+    if (!fs.existsSync(emailsDir)) {
+      return res.json({ emails: [], message: 'No sent emails directory found' });
+    }
+    
+    const files = fs.readdirSync(emailsDir)
+      .filter(file => file.endsWith('.json'))
+      .map(file => {
+        const filePath = path.join(emailsDir, file);
+        const stats = fs.statSync(filePath);
+        const content = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+        
+        return {
+          filename: file,
+          created: stats.ctime,
+          size: stats.size,
+          to: content.to,
+          subject: content.subject
+        };
+      })
+      .sort((a, b) => new Date(b.created) - new Date(a.created));
+    
+    res.json({ emails: files });
+  } catch (error) {
+    log('error', 'Error reading sent emails', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Start server
 async function startServer() {
   try {
     // Test MongoDB connection first
-    const { db } = await connectToDatabase();
+    await connectToDatabase();
     
-    // Test email configuration
-    await testEmailConfig();
+    // Check system mail configuration
+    const systemChecks = await checkSystemMailConfig();
+    log('info', 'System mail configuration', systemChecks);
     
     // Start Express server
     app.listen(PORT, () => {
-      log('info', `Bulk email server running on port ${PORT}`);
-      log('info', `PHP mail script created at: ${phpScriptPath}`);
-      console.log('\nAPI Endpoints:');
+      log('info', `🚀 Node.js email server running on port ${PORT}`);
+      log('info', `📧 Available transporters: ${transporters.length}`);
+      
+      console.log('\n📋 API Endpoints:');
       console.log(`GET  /api/health - Server health check`);
-      console.log(`GET  /api/test-config - Test email configuration`);
+      console.log(`GET  /api/system-check - Check email system configuration`);
       console.log(`POST /api/test-email - Send test email`);
       console.log(`POST /api/send-bulk - Send bulk emails`);
       console.log(`GET  /api/job/:jobId - Check job status`);
       console.log(`GET  /api/jobs - Get all jobs`);
+      console.log(`GET  /api/sent-emails - View sent emails (JSON files)`);
       console.log(`DELETE /api/job/:jobId - Delete job`);
-      console.log('\nDebugging tips:');
-      console.log('1. Test email config: GET /api/test-config');
-      console.log('2. Send test email: POST /api/test-email with {"to": "your-email@domain.com"}');
-      console.log('3. Check server logs for detailed debugging info');
+      
+      console.log('\n🔧 Setup Instructions:');
+      console.log('1. Install mail server: sudo apt-get install sendmail');
+      console.log('2. Or install postfix: sudo apt-get install postfix');
+      console.log('3. Test configuration: curl http://localhost:5000/api/system-check');
+      console.log('4. Send test email: curl -X POST http://localhost:5000/api/test-email -H "Content-Type: application/json" -d \'{"to":"test@example.com"}\'');
+      
+      console.log('\n📁 Note: If no mail server is configured, emails will be saved as JSON files in ./sent_emails/ directory');
     });
   } catch (error) {
     log('error', 'Failed to start server', error);
@@ -565,10 +634,7 @@ startServer();
 
 // Cleanup on exit
 process.on('SIGINT', async () => {
-  log('info', 'Cleaning up...');
-  if (fs.existsSync(phpScriptPath)) {
-    fs.unlinkSync(phpScriptPath);
-  }
+  log('info', '👋 Shutting down server...');
   await client.close();
   process.exit(0);
 });

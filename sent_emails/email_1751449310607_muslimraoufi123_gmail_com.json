@@ -1,0 +1,20 @@
+{
+  "from": {
+    "address": "noreply@localhost",
+    "name": "dkjnsdnkjsd"
+  },
+  "to": [
+    {
+      "address": "muslimraoufi123@gmail.com",
+      "name": ""
+    }
+  ],
+  "subject": "kdnskdns",
+  "html": "ndksndkns",
+  "text": "ndksndkns",
+  "headers": {
+    "X-Mailer": "Node.js Email Sender",
+    "X-Priority": "3"
+  },
+  "messageId": "<6562f1bf-1799-878b-56eb-8ebed76692ac@localhost>"
+}
