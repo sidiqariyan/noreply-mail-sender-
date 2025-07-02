@@ -13,7 +13,7 @@ const App = () => {
   // Fetch all jobs from the backend
   const fetchJobs = async () => {
     try {
-      const response = await fetch("https://vedive.com:5000/api/jobs");
+      const response = await fetch("http://ec2-51-20-248-157.eu-north-1.compute.amazonaws.com:5000/api/jobs");
       const data = await response.json();
       setJobs(data);
     } catch (error) {
@@ -24,7 +24,7 @@ const App = () => {
   // Fetch job status by jobId
   const fetchJobStatus = async (id) => {
     try {
-      const response = await fetch(`https://vedive.com:5000/api/job/${id}`);
+      const response = await fetch(`http://ec2-51-20-248-157.eu-north-1.compute.amazonaws.com:5000/api/job/${id}`);
       const data = await response.json();
       alert(JSON.stringify(data, null, 2));
     } catch (error) {
@@ -36,7 +36,7 @@ const App = () => {
   const sendBulkEmails = async () => {
     setLoading(true);
     try {
-      const response = await fetch("https://vedive.com:5000/api/send-bulk", {
+      const response = await fetch("http://ec2-51-20-248-157.eu-north-1.compute.amazonaws.com:5000/api/send-bulk", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -65,7 +65,7 @@ const App = () => {
   // Delete a job
   const deleteJob = async (id) => {
     try {
-      const response = await fetch(`https://vedive.com:5000/api/job/${id}`, {
+      const response = await fetch(`http://ec2-51-20-248-157.eu-north-1.compute.amazonaws.com:5000/api/job/${id}`, {
         method: "DELETE",
       });
       const data = await response.json();
