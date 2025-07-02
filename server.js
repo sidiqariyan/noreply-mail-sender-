@@ -29,7 +29,7 @@ function log(level, message, data = null) {
 }
 
 // Configure nodemailer transporter (more reliable than PHP mail)
-const transporter = nodemailer.createTransporter({
+const transporter = nodemailer.createTransport({
   host: 'localhost', // Use local sendmail
   port: 25,
   secure: false,
@@ -288,7 +288,7 @@ app.get('/api/test-config', async (req, res) => {
 // Test email endpoint
 app.post('/api/test-email', async (req, res) => {
   try {
-    const { to, fromName = 'Test Sender', fromEmail = 'noreply@vedive.com' } = req.body;
+    const { to, fromName = 'Test Sender', fromEmail = 'noreply@ec2-51-20-248-157.eu-north-1.compute.amazonaws.com' } = req.body;
     
     if (!to) {
       return res.status(400).json({ error: 'Recipient email is required' });
@@ -332,7 +332,7 @@ app.post('/api/send-bulk', async (req, res) => {
       subject,
       message,
       fromName: fromName || 'No Reply',
-      fromEmail: fromEmail || 'noreply@vedive.com'
+      fromEmail: fromEmail || 'noreply@ec2-51-20-248-157.eu-north-1.compute.amazonaws.com'
     };
     
     const jobId = Date.now().toString();
